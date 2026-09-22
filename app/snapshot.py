@@ -1,19 +1,28 @@
 """Experimental-data snapshot backup & atomic restore.
 
 A snapshot is a zip archive (always written with forward-slash zip member
-names) containing one JSONL file per table plus a ``manifest.json``:
+names) containing one JSONL file per table plus a ``manifest.json``.
+
+v2 (current) members::
 
     manifest.json
-    settings.jsonl   -- exactly 1 row, kept only for reference
-    events.jsonl     -- one event per line, fixed field order
-    attempts.jsonl   -- one attempt per line, fixed field order
+    settings.jsonl    -- exactly 1 row, the legacy single-target config,
+                         kept only for reference (current settings preserved)
+    targets.jsonl     -- 0-5 named fanout targets (0 => single-target mode)
+    events.jsonl      -- one event per line, fixed field order
+    deliveries.jsonl  -- per (event, target) delivery state
+    attempts.jsonl    -- one HTTP attempt per line, fixed field order
+
+v1 snapshots (settings/events/attempts, no target_id) are still accepted on
+restore: rows are migrated in memory -- attempts gain ``target_id=null`` and
+there are no targets/deliveries -- but new backups are always written as v2.
 
 Each JSONL file lists its fields in a single fixed order (the order declared
 in ``FIELDS`` below), and the manifest records per-file line counts, sizes,
 SHA-256 digests and the database schema version. Restore validates *everything*
-(manifest, digests, field sets, types, event-payload parseability, foreign
-keys) and raises :class:`SnapshotError` on the first problem -- no row is
-written until all checks pass.
+(manifest, digests, field sets, types, payload parseability, foreign keys) and
+raises :class:`SnapshotError` on the first problem -- no row is written until
+all checks pass.
 """
 from __future__ import annotations
 
@@ -27,15 +36,45 @@ from typing import Any
 from . import db
 
 FORMAT = "webhook-replay-lab-snapshot"
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
+LEGACY_FORMAT_VERSION = 1
 
 SETTINGS_FILE = "settings.jsonl"
+TARGETS_FILE = "targets.jsonl"
 EVENTS_FILE = "events.jsonl"
+DELIVERIES_FILE = "deliveries.jsonl"
 ATTEMPTS_FILE = "attempts.jsonl"
 MANIFEST_NAME = "manifest.json"
 
-# Fixed on-disk field order for every JSONL table.
+V2_FILES = (SETTINGS_FILE, TARGETS_FILE, EVENTS_FILE, DELIVERIES_FILE,
+            ATTEMPTS_FILE)
+V1_FILES = (SETTINGS_FILE, EVENTS_FILE, ATTEMPTS_FILE)
+
+# Fixed on-disk field order for every JSONL table (v2).
 FIELDS: dict[str, list[str]] = {
+    SETTINGS_FILE: [
+        "id", "target_url", "hmac_secret", "max_retries", "timeout_seconds",
+    ],
+    TARGETS_FILE: [
+        "id", "name", "url", "hmac_secret", "max_retries", "timeout_seconds",
+        "created_at", "updated_at",
+    ],
+    EVENTS_FILE: [
+        "event_id", "seq", "payload", "status", "created_at", "updated_at",
+    ],
+    DELIVERIES_FILE: [
+        "event_id", "target_id", "status", "replay_no", "attempts_count",
+        "last_http_status", "last_outcome", "last_attempt_at", "updated_at",
+    ],
+    ATTEMPTS_FILE: [
+        "id", "event_id", "target_id", "attempt_no", "replay_no", "idem_key",
+        "request_at", "response_at", "http_status", "outcome", "elapsed_ms",
+        "req_headers", "resp_excerpt",
+    ],
+}
+
+# Field order used by v1 archives (attempts had no target_id).
+V1_FIELDS: dict[str, list[str]] = {
     SETTINGS_FILE: [
         "id", "target_url", "hmac_secret", "max_retries", "timeout_seconds",
     ],
@@ -50,6 +89,7 @@ FIELDS: dict[str, list[str]] = {
 }
 
 EVENT_STATUSES = {"pending", "queued", "running", "success", "failed"}
+DELIVERY_STATUSES = EVENT_STATUSES
 ATTEMPT_OUTCOMES = {"delivered", "retriable", "non_retriable"}
 
 # Simple guard against oversized / decompression-bomb uploads.
@@ -58,6 +98,9 @@ MAX_TOTAL_UNCOMPRESSED = 256 * 1024 * 1024
 
 # statuses that describe dispatch work which cannot survive a restart
 TRANSIENT_STATUSES = {"queued", "running"}
+
+# Maximum number of named targets inside one snapshot.
+MAX_TARGETS = 5
 
 
 class SnapshotError(Exception):
@@ -93,7 +136,9 @@ def create_backup() -> tuple[bytes, str, dict[str, Any]]:
 
     payload: dict[str, bytes] = {
         SETTINGS_FILE: _encode_jsonl(snap["settings"], FIELDS[SETTINGS_FILE]),
+        TARGETS_FILE: _encode_jsonl(snap["targets"], FIELDS[TARGETS_FILE]),
         EVENTS_FILE: _encode_jsonl(snap["events"], FIELDS[EVENTS_FILE]),
+        DELIVERIES_FILE: _encode_jsonl(snap["deliveries"], FIELDS[DELIVERIES_FILE]),
         ATTEMPTS_FILE: _encode_jsonl(snap["attempts"], FIELDS[ATTEMPTS_FILE]),
     }
     files = [_file_meta(name, data) for name, data in payload.items()]
@@ -135,8 +180,10 @@ def _is_number(v: Any) -> bool:
 def parse_snapshot(content: bytes) -> dict[str, Any]:
     """Validate an uploaded archive fully without touching the database.
 
-    Returns ``{"manifest", "settings", "events", "attempts"}`` with parsed
-    rows. Raises :class:`SnapshotError` on any problem.
+    Returns ``{"manifest", "settings", "targets", "events", "deliveries",
+    "attempts", "format_version"}`` with parsed rows (v1 archives are migrated
+    in memory: empty targets/deliveries, attempts with ``target_id=null``).
+    Raises :class:`SnapshotError` on any problem.
     """
     if not content:
         raise SnapshotError("上传内容为空，请选择有效的快照压缩包")
@@ -149,16 +196,6 @@ def parse_snapshot(content: bytes) -> dict[str, Any]:
         raise SnapshotError("不是有效的 zip 压缩包")
 
     names = zf.namelist()
-    expected = {MANIFEST_NAME, SETTINGS_FILE, EVENTS_FILE, ATTEMPTS_FILE}
-    if set(names) != expected:
-        missing = sorted(expected - set(names))
-        extra = sorted(set(names) - expected)
-        bits = []
-        if missing:
-            bits.append(f"缺少文件 {missing}")
-        if extra:
-            bits.append(f"存在未预期文件 {extra}")
-        raise SnapshotError("快照结构不合法：" + "；".join(bits))
 
     total = 0
     raw: dict[str, bytes] = {}
@@ -172,33 +209,186 @@ def parse_snapshot(content: bytes) -> dict[str, Any]:
     zf.close()
 
     errors: list[str] = []
-    manifest = _validate_manifest(raw[MANIFEST_NAME], raw, errors)
+    manifest = _read_manifest(raw.get(MANIFEST_NAME), errors)
+    format_version = manifest.get("format_version") if manifest else None
+    db_version = manifest.get("db_version") if manifest else None
+
+    if format_version == FORMAT_VERSION:
+        expected = set(V2_FILES)
+        fields_map = FIELDS
+    elif format_version == LEGACY_FORMAT_VERSION:
+        expected = set(V1_FILES)
+        fields_map = V1_FIELDS
+    else:
+        raise SnapshotError(
+            f"不支持的快照格式版本：{format_version!r}"
+            f"（当前服务支持 v{LEGACY_FORMAT_VERSION}/v{FORMAT_VERSION}）")
+
+    if set(names) != expected | {MANIFEST_NAME}:
+        missing = sorted((expected | {MANIFEST_NAME}) - set(names))
+        extra = sorted(set(names) - (expected | {MANIFEST_NAME}))
+        bits = []
+        if missing:
+            bits.append(f"缺少文件 {missing}")
+        if extra:
+            bits.append(f"存在未预期文件 {extra}")
+        raise SnapshotError("快照结构不合法：" + "；".join(bits))
+
+    # version-specific db_version compatibility
+    expected_dbv = {FORMAT_VERSION: db.SCHEMA_VERSION,
+                    LEGACY_FORMAT_VERSION: 1}.get(format_version)
+    if db_version != expected_dbv:
+        errors.append(
+            f"{MANIFEST_NAME}: 数据库版本不兼容（快照 v{db_version}，"
+            f"v{format_version} 格式要求 v{expected_dbv}）")
+
+    _check_file_metas(manifest, raw, expected, errors)
 
     tables: dict[str, list[dict[str, Any]]] = {}
-    for fname in (SETTINGS_FILE, EVENTS_FILE, ATTEMPTS_FILE):
-        tables[fname] = _validate_jsonl(fname, raw[fname],
-                                        manifest, errors)
+    for fname in expected:
+        tables[fname] = _validate_jsonl(
+            fname, raw[fname], fields_map[fname], errors)
 
     settings = tables[SETTINGS_FILE]
     events = tables[EVENTS_FILE]
     attempts = tables[ATTEMPTS_FILE]
+    targets = tables.get(TARGETS_FILE, [])
+    deliveries = tables.get(DELIVERIES_FILE, [])
 
-    # ---- table-specific semantic checks ----
+    if format_version == LEGACY_FORMAT_VERSION:
+        # migrate v1 rows into the v2 shape
+        for a in attempts:
+            a["target_id"] = None
+
+    _validate_settings(settings, errors)
+    target_ids = _validate_targets(targets, format_version, errors)
+    event_ids = _validate_events(events, errors)
+    _validate_deliveries(deliveries, target_ids, event_ids, errors)
+    _validate_attempts(attempts, target_ids, event_ids, errors)
+
+    if errors:
+        raise SnapshotError(
+            f"快照校验失败，共 {len(errors)} 处错误，已拒绝写入：\n- "
+            + "\n- ".join(errors))
+
+    return {
+        "manifest": manifest,
+        "format_version": format_version,
+        "settings": settings,
+        "targets": targets,
+        "events": events,
+        "deliveries": deliveries,
+        "attempts": attempts,
+    }
+
+
+def _read_manifest(raw_manifest: bytes | None, errors: list[str]) -> dict[str, Any] | None:
+    if raw_manifest is None:
+        raise SnapshotError("快照结构不合法：缺少文件 ['manifest.json']")
+    try:
+        text = raw_manifest.decode("utf-8")
+    except UnicodeDecodeError:
+        raise SnapshotError(f"{MANIFEST_NAME}: 不是 UTF-8 文本")
+    try:
+        manifest = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise SnapshotError(f"{MANIFEST_NAME}: 不是合法 JSON（{exc.msg}）")
+    if not isinstance(manifest, dict):
+        raise SnapshotError(f"{MANIFEST_NAME}: 必须是 JSON 对象")
+    if manifest.get("format") != FORMAT:
+        errors.append(f"{MANIFEST_NAME}: format 不匹配（{manifest.get('format')!r}）")
+    if not _is_int(manifest.get("format_version")):
+        errors.append(f"{MANIFEST_NAME}: format_version 缺失或不是整数")
+    if not _is_int(manifest.get("db_version")):
+        errors.append(f"{MANIFEST_NAME}: db_version 缺失或不是整数")
+    files = manifest.get("files")
+    if not isinstance(files, dict):
+        errors.append(f"{MANIFEST_NAME}: files 缺失或不是对象")
+    return manifest
+
+
+def _check_file_metas(manifest: dict[str, Any] | None, raw: dict[str, bytes],
+                      expected: set[str], errors: list[str]) -> None:
+    files = manifest.get("files") if manifest else None
+    if not isinstance(files, dict):
+        return
+    for fname in expected:
+        data = raw[fname]
+        meta = files.get(fname)
+        if not isinstance(meta, dict):
+            errors.append(f"{MANIFEST_NAME}: files 缺少 {fname} 的元数据")
+            continue
+        digest = hashlib.sha256(data).hexdigest()
+        if meta.get("sha256") != digest:
+            errors.append(f"{fname}: SHA-256 与 manifest 不符（文件可能已损坏或被篡改）")
+        n_lines = data.count(b"\n")
+        if meta.get("lines") != n_lines:
+            errors.append(
+                f"{fname}: 行数与 manifest 不符（记录 {meta.get('lines')}，实际 {n_lines}）")
+        if meta.get("bytes") != len(data):
+            errors.append(
+                f"{fname}: 字节数与 manifest 不符（记录 {meta.get('bytes')}，实际 {len(data)}）")
+
+
+def _validate_settings(settings: list[dict[str, Any]], errors: list[str]) -> None:
     if len(settings) != 1:
         errors.append(f"{SETTINGS_FILE}: 必须恰好包含 1 行设置，实际 {len(settings)} 行")
-    elif settings[0].get("id") != 1:
+        return
+    if settings[0].get("id") != 1:
         errors.append(f"{SETTINGS_FILE}: 唯一一行的 id 必须为 1")
-    else:
-        s = settings[0]
-        if not _is_str(s.get("target_url")):
-            errors.append(f"{SETTINGS_FILE}: target_url 必须是非空字符串")
-        if not isinstance(s.get("hmac_secret"), str):
-            errors.append(f"{SETTINGS_FILE}: hmac_secret 必须是字符串")
-        if not _is_int(s.get("max_retries")) or not 0 <= s["max_retries"] <= 10:
-            errors.append(f"{SETTINGS_FILE}: max_retries 必须是 0–10 的整数")
-        if not _is_number(s.get("timeout_seconds")) or not 0 < s["timeout_seconds"] <= 60:
-            errors.append(f"{SETTINGS_FILE}: timeout_seconds 必须是 0–60 之间的数字")
+    s = settings[0]
+    if not _is_str(s.get("target_url")):
+        errors.append(f"{SETTINGS_FILE}: target_url 必须是非空字符串")
+    if not isinstance(s.get("hmac_secret"), str):
+        errors.append(f"{SETTINGS_FILE}: hmac_secret 必须是字符串")
+    if not _is_int(s.get("max_retries")) or not 0 <= s["max_retries"] <= 10:
+        errors.append(f"{SETTINGS_FILE}: max_retries 必须是 0–10 的整数")
+    if not _is_number(s.get("timeout_seconds")) or not 0 < s["timeout_seconds"] <= 60:
+        errors.append(f"{SETTINGS_FILE}: timeout_seconds 必须是 0–60 之间的数字")
 
+
+def _validate_targets(targets: list[dict[str, Any]], format_version: int,
+                      errors: list[str]) -> set[int]:
+    if format_version == LEGACY_FORMAT_VERSION:
+        return set()
+    if len(targets) > MAX_TARGETS:
+        errors.append(
+            f"{TARGETS_FILE}: 命名目标最多 {MAX_TARGETS} 个，实际 {len(targets)} 个"
+            "（0 个表示使用单目标兼容模式）")
+    ids: set[int] = set()
+    names: set[str] = set()
+    for i, t in enumerate(targets, 1):
+        tid = t.get("id")
+        if not _is_int(tid) or tid < 1:
+            errors.append(f"{TARGETS_FILE} 第 {i} 行: id 必须是 ≥1 的整数")
+        elif tid in ids:
+            errors.append(f"{TARGETS_FILE} 第 {i} 行: id 重复：{tid}")
+        else:
+            ids.add(tid)
+        name = t.get("name")
+        if not _is_str(name):
+            errors.append(f"{TARGETS_FILE} 第 {i} 行: name 必须是非空字符串")
+        elif name in names:
+            errors.append(f"{TARGETS_FILE} 第 {i} 行: name 重复：{name!r}")
+        else:
+            names.add(name)
+        if not _is_str(t.get("url")) or not (
+                t["url"].startswith("http://") or t["url"].startswith("https://")):
+            errors.append(
+                f"{TARGETS_FILE} 第 {i} 行: url 必须是 http(s):// 开头的非空字符串")
+        if not isinstance(t.get("hmac_secret"), str):
+            errors.append(f"{TARGETS_FILE} 第 {i} 行: hmac_secret 必须是字符串")
+        if not _is_int(t.get("max_retries")) or not 0 <= t["max_retries"] <= 10:
+            errors.append(f"{TARGETS_FILE} 第 {i} 行: max_retries 必须是 0–10 的整数")
+        if not _is_number(t.get("timeout_seconds")) or not 0 < t["timeout_seconds"] <= 60:
+            errors.append(f"{TARGETS_FILE} 第 {i} 行: timeout_seconds 必须是 0–60 之间的数字")
+        for col in ("created_at", "updated_at"):
+            if not _is_str(t.get(col)):
+                errors.append(f"{TARGETS_FILE} 第 {i} 行: {col} 必须是非空字符串")
+    return ids
+
+
+def _validate_events(events: list[dict[str, Any]], errors: list[str]) -> set[str]:
     event_ids: set[str] = set()
     seqs: set[int] = set()
     for i, e in enumerate(events, 1):
@@ -234,7 +424,50 @@ def parse_snapshot(content: bytes) -> dict[str, Any]:
         for col in ("created_at", "updated_at"):
             if not _is_str(e.get(col)):
                 errors.append(f"{EVENTS_FILE} 第 {i} 行: {col} 必须是非空字符串")
+    return event_ids
 
+
+def _validate_deliveries(deliveries: list[dict[str, Any]], target_ids: set[int],
+                         event_ids: set[str], errors: list[str]) -> None:
+    seen: set[tuple[str, int]] = set()
+    for i, d in enumerate(deliveries, 1):
+        eid = d.get("event_id")
+        tid = d.get("target_id")
+        if eid not in event_ids:
+            errors.append(
+                f"{DELIVERIES_FILE} 第 {i} 行: 外键 event_id={eid!r} 在 events.jsonl 中不存在")
+        if not _is_int(tid) or tid not in target_ids:
+            errors.append(
+                f"{DELIVERIES_FILE} 第 {i} 行: 外键 target_id={tid!r} 在 targets.jsonl 中不存在")
+        elif (eid, tid) in seen:
+            errors.append(
+                f"{DELIVERIES_FILE} 第 {i} 行: (event_id, target_id) 重复："
+                f"({eid!r}, {tid})")
+        else:
+            seen.add((eid, tid))
+        if d.get("status") not in DELIVERY_STATUSES:
+            errors.append(
+                f"{DELIVERIES_FILE} 第 {i} 行: status 非法（{d.get('status')!r}）")
+        if not _is_int(d.get("replay_no")) or d["replay_no"] < 0:
+            errors.append(f"{DELIVERIES_FILE} 第 {i} 行: replay_no 必须是 ≥0 的整数")
+        if not _is_int(d.get("attempts_count")) or d["attempts_count"] < 0:
+            errors.append(f"{DELIVERIES_FILE} 第 {i} 行: attempts_count 必须是 ≥0 的整数")
+        hs = d.get("last_http_status")
+        if hs is not None and (not _is_int(hs) or not 100 <= hs <= 599):
+            errors.append(
+                f"{DELIVERIES_FILE} 第 {i} 行: last_http_status 必须是 100–599 的整数或 null")
+        if d.get("last_outcome") is not None and d["last_outcome"] not in ATTEMPT_OUTCOMES:
+            errors.append(
+                f"{DELIVERIES_FILE} 第 {i} 行: last_outcome 非法（{d.get('last_outcome')!r}）")
+        la = d.get("last_attempt_at")
+        if la is not None and not _is_str(la):
+            errors.append(f"{DELIVERIES_FILE} 第 {i} 行: last_attempt_at 必须是字符串或 null")
+        if not _is_str(d.get("updated_at")):
+            errors.append(f"{DELIVERIES_FILE} 第 {i} 行: updated_at 必须是非空字符串")
+
+
+def _validate_attempts(attempts: list[dict[str, Any]], target_ids: set[int],
+                       event_ids: set[str], errors: list[str]) -> None:
     attempt_ids: set[int] = set()
     for i, a in enumerate(attempts, 1):
         aid = a.get("id")
@@ -248,6 +481,11 @@ def parse_snapshot(content: bytes) -> dict[str, Any]:
             errors.append(
                 f"{ATTEMPTS_FILE} 第 {i} 行: 外键 event_id={a.get('event_id')!r}"
                 " 在 events.jsonl 中不存在")
+        tid = a.get("target_id")
+        if tid is not None and (not _is_int(tid) or tid not in target_ids):
+            errors.append(
+                f"{ATTEMPTS_FILE} 第 {i} 行: 外键 target_id={tid!r} 在 targets.jsonl 中不存在"
+                "（单目标模式应为 null）")
         if not _is_int(a.get("attempt_no")) or a["attempt_no"] < 1:
             errors.append(f"{ATTEMPTS_FILE} 第 {i} 行: attempt_no 必须是 ≥1 的整数")
         if not _is_int(a.get("replay_no")) or a["replay_no"] < 1:
@@ -274,75 +512,10 @@ def parse_snapshot(content: bytes) -> dict[str, Any]:
         if a.get("resp_excerpt") is not None and not isinstance(a["resp_excerpt"], str):
             errors.append(f"{ATTEMPTS_FILE} 第 {i} 行: resp_excerpt 必须是字符串或 null")
 
-    if errors:
-        raise SnapshotError(
-            f"快照校验失败，共 {len(errors)} 处错误，已拒绝写入：\n- "
-            + "\n- ".join(errors))
 
-    return {
-        "manifest": manifest,
-        "settings": settings,
-        "events": events,
-        "attempts": attempts,
-    }
-
-
-def _validate_manifest(raw_manifest: bytes, raw_files: dict[str, bytes],
-                       errors: list[str]) -> dict[str, Any] | None:
-    try:
-        text = raw_manifest.decode("utf-8")
-    except UnicodeDecodeError:
-        errors.append(f"{MANIFEST_NAME}: 不是 UTF-8 文本")
-        return None
-    try:
-        manifest = json.loads(text)
-    except json.JSONDecodeError as exc:
-        errors.append(f"{MANIFEST_NAME}: 不是合法 JSON（{exc.msg}）")
-        return None
-    if not isinstance(manifest, dict):
-        errors.append(f"{MANIFEST_NAME}: 必须是 JSON 对象")
-        return None
-    if manifest.get("format") != FORMAT:
-        errors.append(f"{MANIFEST_NAME}: format 不匹配（{manifest.get('format')!r}）")
-    if manifest.get("format_version") != FORMAT_VERSION:
-        errors.append(
-            f"{MANIFEST_NAME}: format_version 必须为 {FORMAT_VERSION}，"
-            f"实际为 {manifest.get('format_version')!r}")
-    if not _is_int(manifest.get("db_version")):
-        errors.append(f"{MANIFEST_NAME}: db_version 缺失或不是整数")
-    elif manifest["db_version"] != db.SCHEMA_VERSION:
-        errors.append(
-            f"{MANIFEST_NAME}: 数据库版本不兼容（快照 v{manifest['db_version']}，"
-            f"当前 v{db.SCHEMA_VERSION}）")
-    files = manifest.get("files")
-    if not isinstance(files, dict):
-        errors.append(f"{MANIFEST_NAME}: files 缺失或不是对象")
-        return manifest
-
-    for fname, data in raw_files.items():
-        if fname == MANIFEST_NAME:
-            continue
-        meta = files.get(fname)
-        if not isinstance(meta, dict):
-            errors.append(f"{MANIFEST_NAME}: files 缺少 {fname} 的元数据")
-            continue
-        digest = hashlib.sha256(data).hexdigest()
-        if meta.get("sha256") != digest:
-            errors.append(f"{fname}: SHA-256 与 manifest 不符（文件可能已损坏或被篡改）")
-        n_lines = data.count(b"\n")
-        if meta.get("lines") != n_lines:
-            errors.append(
-                f"{fname}: 行数与 manifest 不符（记录 {meta.get('lines')}，实际 {n_lines}）")
-        if meta.get("bytes") != len(data):
-            errors.append(
-                f"{fname}: 字节数与 manifest 不符（记录 {meta.get('bytes')}，实际 {len(data)}）")
-    return manifest
-
-
-def _validate_jsonl(fname: str, data: bytes, manifest: dict[str, Any] | None,
+def _validate_jsonl(fname: str, data: bytes, expected_fields: list[str],
                     errors: list[str]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    expected_fields = FIELDS[fname]
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError:

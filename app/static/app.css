@@ -192,3 +192,24 @@ a.link { color: var(--accent); cursor: pointer; }
   .grid4 { grid-template-columns: 1fr 1fr; }
   .grid4 .span2 { grid-column: span 2; }
 }
+
+/* ---- fanout target configuration ---- */
+.tgt-tabs { display: flex; gap: 8px; margin-bottom: 14px; }
+.tgt-tab {
+  background: transparent; border: 1px solid var(--border);
+  border-radius: 8px 8px 0 0; color: var(--muted);
+  padding: 8px 16px; font-size: 13px;
+}
+.tgt-tab.active {
+  background: var(--panel-2); color: var(--accent);
+  border-color: var(--accent); border-bottom-color: transparent;
+}
+.tgt-pane.hidden { display: none; }
+.tgt-table { margin-top: 4px; }
+.tgt-table input { width: 100%; }
+.tgt-table .t-retries, .tgt-table .t-timeout { text-align: center; }
+button.t-del { padding: 4px 8px; }
+.badge-wrap { display: flex; flex-wrap: wrap; gap: 4px; }
+.tgt-badge { font-family: ui-monospace, Menlo, monospace; }
+
+.modal-wide { width: min(1080px, 100%); }

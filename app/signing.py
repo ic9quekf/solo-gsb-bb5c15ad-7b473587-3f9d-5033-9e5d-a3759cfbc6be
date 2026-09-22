@@ -34,6 +34,13 @@ def verify(body: bytes, secret: str, header: str, tolerance: int = 300) -> bool:
     return hmac.compare_digest(expected.split("v1=", 1)[1], sig)
 
 
-def idempotency_key(event_id: str, replay_no: int) -> str:
+def idempotency_key(event_id: str, replay_no: int,
+                    target_name: str | None = None) -> str:
+    # Legacy single-target format (kept so old snapshots/tests stay stable);
+    # fanout deliveries additionally bind the key to the target name, so every
+    # (event, target) pair in one replay round has an independent idempotency
+    # key -- matching the independently signed/delivered requests.
     raw = f"{event_id}#replay={replay_no}"
+    if target_name:
+        raw = f"{event_id}#target={target_name}#replay={replay_no}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()

@@ -26,6 +26,52 @@ def wait_until(predicate, timeout=20, label="condition"):
     raise AssertionError(f"timeout waiting for {label}")
 
 
+def _build_v1_snapshot(v2_blob: bytes) -> bytes:
+    """Downgrade a current v2 snapshot zip into a legacy v1 archive.
+
+    Drops targets.jsonl/deliveries.jsonl, removes target_id from attempts and
+    rewrites the manifest with format_version/db_version = 1.
+    """
+    zin = zipfile.ZipFile(io.BytesIO(v2_blob))
+    v1_fields = {
+        "settings.jsonl": ["id", "target_url", "hmac_secret", "max_retries",
+                           "timeout_seconds"],
+        "events.jsonl": ["event_id", "seq", "payload", "status",
+                         "created_at", "updated_at"],
+        "attempts.jsonl": ["id", "event_id", "attempt_no", "replay_no",
+                           "idem_key", "request_at", "response_at",
+                           "http_status", "outcome", "elapsed_ms",
+                           "req_headers", "resp_excerpt"],
+    }
+    payload = {}
+    for fname, fields in v1_fields.items():
+        rows = [json.loads(line) for line in zin.read(fname).decode().splitlines()
+                if line]
+        buf = io.BytesIO()
+        for row in rows:
+            buf.write((json.dumps({f: row.get(f) for f in fields},
+                                  ensure_ascii=False, separators=(",", ":"))
+                       + "\n").encode())
+        payload[fname] = buf.getvalue()
+    files = {}
+    for name, data in payload.items():
+        files[name] = {
+            "name": name, "lines": data.count(b"\n"), "bytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest()}
+    manifest = {
+        "format": "webhook-replay-lab-snapshot", "format_version": 1,
+        "db_version": 1, "created_at": "2026-09-22T00:00:00+00:00",
+        "files": files,
+    }
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
+        zout.writestr("manifest.json", json.dumps(manifest, indent=2))
+        for name, data in payload.items():
+            zout.writestr(name, data)
+    zin.close()
+    return out.getvalue()
+
+
 def run(client: TestClient) -> None:
     assert client.get("/healthz").json() == {"status": "ok"}
 
@@ -141,6 +187,228 @@ def run(client: TestClient) -> None:
     # detail for missing event
     assert client.get("/api/events/nope").status_code == 404
 
+    # ---------- multi-target fanout ----------
+
+    def fanout_targets(*specs):
+        return {"targets": [
+            {"name": n, "url": u, "hmac_secret": sec,
+             "max_retries": mr, "timeout_seconds": to}
+            for (n, u, sec, mr, to) in specs]}
+
+    # config validation: 2-5 targets, unique names, http(s) URLs
+    r = client.post("/api/targets", json=fanout_targets(
+        ("only-one", "http://testserver/recv", "s1", 1, 5.0)))
+    assert r.status_code == 422, r.text
+    r = client.post("/api/targets", json=fanout_targets(
+        ("dup", "http://testserver/recv", "s1", 1, 5.0),
+        ("dup", "http://testserver/recv", "s2", 1, 5.0)))
+    assert r.status_code == 422 and "唯一" in r.text, r.text
+    r = client.post("/api/targets", json=fanout_targets(
+        ("a", "ftp://nope", "s1", 1, 5.0),
+        ("b", "http://testserver/recv", "s2", 1, 5.0)))
+    assert r.status_code == 422 and "http" in r.text, r.text
+
+    # three targets: alpha fails 2x then ok, beta/gamma healthy; each own secret
+    cfg = fanout_targets(
+        ("alpha", "http://testserver/recv?fail=500&times=2", "secret-alpha", 3, 5.0),
+        ("beta", "http://testserver/recv", "secret-beta", 3, 5.0),
+        ("gamma", "http://testserver/recv", "secret-gamma", 0, 5.0))
+    r = client.post("/api/targets", json=cfg)
+    assert r.status_code == 200, r.text
+    assert r.json()["mode"] == "fanout" and r.json()["count"] == 3
+    got = client.get("/api/targets").json()
+    assert [t["name"] for t in got["targets"]] == ["alpha", "beta", "gamma"]
+    # legacy single-target settings are untouched by target config
+    assert client.get("/api/settings").json()["target_url"].endswith("sleep=2")
+
+    client.post("/api/events/import", json=[
+        {"event_id": "fan-1", "type": "fanout.a"},
+        {"event_id": "fan-2", "type": "fanout.b"},
+    ])
+    r = client.post("/api/replay", json={})
+    assert r.status_code == 200 and r.json()["scope"] == "all"
+    wait_until(
+        lambda: client.get("/api/status").json()["counts"]["success"]
+        == client.get("/api/status").json()["total"],
+        timeout=90, label="all events delivered to every target")
+    st = client.get("/api/status").json()
+    assert st["mode"] == "fanout" and st["targets"] == 3
+    assert st["delivery_counts"]["success"] == 3 * st["total"], st
+
+    d = client.get("/api/events/fan-1").json()
+    by_name = {x["target_name"]: x for x in d["deliveries"]}
+    assert set(by_name) == {"alpha", "beta", "gamma"}
+    assert all(x["status"] == "success" for x in by_name.values())
+    # alpha needed 3 attempts (500,500,200); beta/gamma one each
+    assert by_name["alpha"]["attempts_count"] == 3
+    assert by_name["beta"]["attempts_count"] == by_name["gamma"]["attempts_count"] == 1
+
+    # per-target independent signatures + distinct idempotency keys per target
+    from app.signing import canonical_body as cb, verify as vfy
+    per_target_headers: dict[str, dict] = {}
+    for a in d["timeline"]:
+        if a["http_status"] == 200:
+            per_target_headers.setdefault(a["target_name"], json.loads(a["req_headers"]))
+    assert set(per_target_headers) == {"alpha", "beta", "gamma"}
+    secrets = {"alpha": "secret-alpha", "beta": "secret-beta", "gamma": "secret-gamma"}
+    raw = cb(d["payload_parsed"])
+    idem_keys = set()
+    for name, hdr in per_target_headers.items():
+        assert hdr["X-Webhook-Target"] == name
+        assert vfy(raw, secrets[name], hdr["X-Webhook-Signature"]), name
+        assert not vfy(raw, "wrong-secret", hdr["X-Webhook-Signature"])
+        idem_keys.add(hdr["Idempotency-Key"])
+    assert len(idem_keys) == 3, "each target gets its own idempotency key"
+
+    # each successful 2xx was logged by the receiver with the target header
+    logs = client.get("/recv/logs?limit=500").json()["logs"]
+    fan1_ok = [l for l in logs if l["event"] == "fan-1" and l["status_returned"] == 200]
+    assert {l["target"] for l in fan1_ok} == {"alpha", "beta", "gamma"}
+
+    # partial failure: one target is unconditionally 422 (non-retriable).
+    # existing targets keep their ids (matched by name); gamma is removed ->
+    # its historical attempts/deliveries cascade away by design.
+    client.post("/api/targets", json=fanout_targets(
+        ("alpha", "http://testserver/recv", "secret-alpha", 0, 5.0),
+        ("beta", "http://testserver/recv", "secret-beta", 0, 5.0),
+        ("broken", "http://testserver/recv?fail=422&times=9", "secret-broken", 0, 5.0)))
+    client.post("/api/events/import", json=[{"event_id": "fan-3", "type": "fanout.c"}])
+    client.post("/api/events/fan-3/replay", json={"scope": "all"})
+    wait_until(lambda: client.get("/api/events/fan-3").json()["status"] == "failed",
+               timeout=15, label="fan-3 partial failure")
+    d = client.get("/api/events/fan-3").json()
+    by_name = {x["target_name"]: x for x in d["deliveries"]}
+    assert by_name["alpha"]["status"] == by_name["beta"]["status"] == "success"
+    assert by_name["broken"]["status"] == "failed"
+    assert by_name["broken"]["last_http_status"] == 422
+    broken_attempts = [a for a in d["timeline"] if a["target_name"] == "broken"]
+    assert len(broken_attempts) == 1 and broken_attempts[0]["outcome"] == "non_retriable"
+    # the good targets are not touched again: still one attempt each
+    for name in ("alpha", "beta"):
+        ats = [a for a in d["timeline"] if a["target_name"] == name]
+        assert len(ats) == 1 and ats[0]["http_status"] == 200
+
+    # retry ONLY the failed target -> it is now healthy, others are skipped
+    client.post("/api/targets", json=fanout_targets(
+        ("alpha", "http://testserver/recv", "secret-alpha", 0, 5.0),
+        ("beta", "http://testserver/recv", "secret-beta", 0, 5.0),
+        ("broken", "http://testserver/recv", "secret-broken", 0, 5.0)))
+    r = client.post("/api/events/fan-3/replay", json={"scope": "failed"})
+    assert r.status_code == 200 and r.json()["scope"] == "failed"
+    wait_until(lambda: client.get("/api/events/fan-3").json()["status"] == "success",
+               timeout=15, label="fan-3 healed via failed-only retry")
+    d = client.get("/api/events/fan-3").json()
+    by_name = {x["target_name"]: x for x in d["deliveries"]}
+    assert all(x["status"] == "success" for x in by_name.values())
+    # alpha/beta attempts counts stay at 1; broken gained a fresh round
+    assert by_name["alpha"]["attempts_count"] == by_name["beta"]["attempts_count"] == 1
+    assert by_name["broken"]["attempts_count"] == 1  # reset counters, one 200
+    broken_keys = [a["idem_key"] for a in d["timeline"] if a["target_name"] == "broken"]
+    assert len(set(broken_keys)) == 2, "new replay round must mint a new idem key"
+
+    # a newly added target (and any target without a delivery row) is picked up
+    # by a failed-scope replay; already-successful targets are skipped
+    client.post("/api/targets", json=fanout_targets(
+        ("alpha", "http://testserver/recv", "secret-alpha", 0, 5.0),
+        ("beta", "http://testserver/recv", "secret-beta", 0, 5.0),
+        ("broken", "http://testserver/recv", "secret-broken", 0, 5.0),
+        ("newbie", "http://testserver/recv", "secret-new", 0, 5.0)))
+    before_alpha = client.get("/api/events/fan-1").json()["deliveries"]
+    assert {x["target_name"] for x in before_alpha} == {"alpha", "beta"}
+    # fan-1 is already success, so the only_failed BATCH replay must not touch it
+    r = client.post("/api/replay", json={"only_failed": True})
+    assert r.status_code == 200 and r.json()["queued"] == [], r.text
+    # ...and an explicit failed-scope replay is a no-op once every current
+    # target already has a successful delivery (status stays untouched).
+    # use a fresh event because fan-1..fan-3 predate the newbie target and
+    # legitimately still owe it a delivery in failed scope
+    client.post("/api/events/import", json=[{"event_id": "fan-allok", "type": "ok"}])
+    client.post("/api/events/fan-allok/replay", json={"scope": "all"})
+    wait_until(
+        lambda: client.get("/api/events/fan-allok").json()["status"] == "success",
+        timeout=15, label="fan-allok delivered to all 4 targets")
+    r = client.post("/api/events/fan-allok/replay", json={"scope": "failed"})
+    assert r.status_code == 200 and r.json()["queued"] is False, r.text
+    assert client.get("/api/events/fan-allok").json()["status"] == "success"
+    # explicit failed-scope replay sends to every target not yet successful
+    r = client.post("/api/events/fan-1/replay", json={"scope": "failed"})
+    assert r.status_code == 200
+    wait_until(
+        lambda: {x["target_name"]: x["status"] for x in
+                 client.get("/api/events/fan-1").json()["deliveries"]}.get("newbie")
+        == "success", timeout=15, label="fan-1 delivered to pending targets")
+    d = client.get("/api/events/fan-1").json()
+    by_name = {x["target_name"]: x for x in d["deliveries"]}
+    assert set(by_name) == {"alpha", "beta", "broken", "newbie"}
+    assert all(x["status"] == "success" for x in by_name.values())
+    # alpha/beta counters untouched; broken+newbie got exactly one new attempt
+    assert by_name["alpha"]["attempts_count"] == 3
+    assert by_name["beta"]["attempts_count"] == 1
+    assert by_name["broken"]["attempts_count"] == by_name["newbie"]["attempts_count"] == 1
+    assert d["status"] == "success"
+
+    # cannot edit targets while a delivery is in flight
+    client.post("/api/targets", json=fanout_targets(
+        ("slow", "http://testserver/recv?sleep=2", "s", 0, 5.0),
+        ("fast", "http://testserver/recv", "f", 0, 5.0)))
+    client.post("/api/events/import", json=[{"event_id": "fan-busy", "type": "z"}])
+    client.post("/api/events/fan-busy/replay", json={"scope": "all"})
+    time.sleep(0.3)
+    r = client.post("/api/targets", json=fanout_targets(
+        ("x", "http://testserver/recv", "s", 0, 5.0),
+        ("y", "http://testserver/recv", "f", 0, 5.0)))
+    assert r.status_code == 409, r.text
+    assert client.delete("/api/targets").status_code == 409
+    wait_until(lambda: client.get("/api/events/fan-busy").json()["status"] == "success",
+               timeout=15, label="fan-busy delivered")
+
+    # snapshots carry targets/deliveries; restore brings the fanout state back
+    client.post("/api/targets", json=fanout_targets(
+        ("alpha", "http://testserver/recv", "secret-alpha", 0, 5.0),
+        ("beta", "http://testserver/recv", "secret-beta", 0, 5.0)))
+    client.post("/api/events/import", json=[{"event_id": "fan-cap", "type": "cap"}])
+    client.post("/api/events/fan-cap/replay", json={"scope": "all"})
+    wait_until(lambda: client.get("/api/events/fan-cap").json()["status"] == "success",
+               timeout=15, label="fan-cap delivered")
+    fan_zip = client.get("/api/backup").content
+    fz = zipfile.ZipFile(io.BytesIO(fan_zip))
+    t_rows = [json.loads(x) for x in fz.read("targets.jsonl").decode().splitlines()]
+    dl_rows = [json.loads(x) for x in fz.read("deliveries.jsonl").decode().splitlines()]
+    assert {t["name"] for t in t_rows} == {"alpha", "beta"}
+    cap_dl = [x for x in dl_rows if x["event_id"] == "fan-cap"]
+    assert len(cap_dl) == 2 and all(x["status"] == "success" for x in cap_dl)
+    fz.close()
+    client.delete("/api/targets")
+    assert client.get("/api/targets").json()["mode"] == "single"
+    assert client.get("/api/deliveries").json()["deliveries"] == []
+    assert client.get("/api/events/fan-cap").json()["timeline"] == []
+    r = client.post("/api/restore", content=fan_zip,
+                    headers={"Content-Type": "application/zip"})
+    assert r.status_code == 200, r.text
+    assert r.json()["mode"] == "fanout" and r.json()["counts"]["targets_after"] == 2
+    assert {t["name"] for t in client.get("/api/targets").json()["targets"]} == {"alpha", "beta"}
+    # fan-cap's per-target attempts survived restore with target linkage
+    d = client.get("/api/events/fan-cap").json()
+    assert {a["target_name"] for a in d["timeline"]} == {"alpha", "beta"}
+    assert {x["target_name"] for x in d["deliveries"]} == {"alpha", "beta"}
+    # legacy settings still preserved through a fanout restore
+    assert client.get("/api/settings").json()["target_url"].endswith("sleep=2")
+
+    # v1 snapshots (4 members, no target_id) are migrated on restore
+    v1_blob = _build_v1_snapshot(fan_zip)
+    client.delete("/api/targets")
+    r = client.post("/api/restore", content=v1_blob,
+                    headers={"Content-Type": "application/zip"})
+    assert r.status_code == 200, r.text
+    assert r.json()["mode"] == "single" and r.json()["format_version"] == 1
+    assert client.get("/api/targets").json()["count"] == 0
+    d = client.get("/api/events/fan-cap").json()
+    assert d["status"] == "success" and d["deliveries"] == []
+    assert all(a["target_name"] is None for a in d["timeline"])
+
+    # back to single-target mode for the remaining legacy snapshot tests
+    assert client.delete("/api/targets").status_code == 200
+
     # ---------- snapshot backup / restore ----------
 
     def repack(blob, rewrites=None, manifest_edit=None):
@@ -175,27 +443,39 @@ def run(client: TestClient) -> None:
     good_zip = r.content
     zf = zipfile.ZipFile(io.BytesIO(good_zip))
     assert set(zf.namelist()) == {
-        "manifest.json", "settings.jsonl", "events.jsonl", "attempts.jsonl"}
+        "manifest.json", "settings.jsonl", "targets.jsonl", "events.jsonl",
+        "deliveries.jsonl", "attempts.jsonl"}
     manifest = json.loads(zf.read("manifest.json"))
     assert manifest["format"] == "webhook-replay-lab-snapshot"
-    assert manifest["format_version"] == 1
-    assert manifest["db_version"] >= 1
-    for fname in ("settings.jsonl", "events.jsonl", "attempts.jsonl"):
+    assert manifest["format_version"] == 2
+    assert manifest["db_version"] >= 2
+    for fname in ("settings.jsonl", "targets.jsonl", "events.jsonl",
+                  "deliveries.jsonl", "attempts.jsonl"):
         data = zf.read(fname)
         meta = manifest["files"][fname]
         assert hashlib.sha256(data).hexdigest() == meta["sha256"]
         assert data.count(b"\n") == meta["lines"]
         assert len(data) == meta["bytes"]
+        if not data:
+            continue  # empty table (targets/deliveries in single-target mode)
         assert list(json.loads(data.split(b"\n")[0]).keys()) == {
             "settings.jsonl": ["id", "target_url", "hmac_secret", "max_retries",
                                "timeout_seconds"],
+            "targets.jsonl": ["id", "name", "url", "hmac_secret", "max_retries",
+                              "timeout_seconds", "created_at", "updated_at"],
             "events.jsonl": ["event_id", "seq", "payload", "status",
                              "created_at", "updated_at"],
-            "attempts.jsonl": ["id", "event_id", "attempt_no", "replay_no",
-                               "idem_key", "request_at", "response_at",
+            "deliveries.jsonl": ["event_id", "target_id", "status", "replay_no",
+                                 "attempts_count", "last_http_status",
+                                 "last_outcome", "last_attempt_at", "updated_at"],
+            "attempts.jsonl": ["id", "event_id", "target_id", "attempt_no",
+                               "replay_no", "idem_key", "request_at", "response_at",
                                "http_status", "outcome", "elapsed_ms",
                                "req_headers", "resp_excerpt"],
         }[fname]
+    # empty targets/deliveries while in single-target mode
+    assert zf.read("targets.jsonl") == b""
+    assert zf.read("deliveries.jsonl") == b""
     zf.close()
 
     # restore preserves current settings: change them *after* the backup
