@@ -1,0 +1,26 @@
+[
+  {
+    "event_id": "evt-001",
+    "type": "invoice.created",
+    "customer": "Acme Corp",
+    "amount": 100.00,
+    "currency": "CNY",
+    "created_at": "2026-09-22T09:00:00Z"
+  },
+  {
+    "event_id": "evt-002",
+    "type": "invoice.paid",
+    "customer": "Acme Corp",
+    "amount": 100.00,
+    "currency": "CNY",
+    "paid_at": "2026-09-22T10:00:00Z"
+  },
+  {
+    "event_id": "evt-003",
+    "type": "invoice.refunded",
+    "customer": "Acme Corp",
+    "amount": 50.00,
+    "currency": "CNY",
+    "refunded_at": "2026-09-22T11:30:00Z"
+  }
+]

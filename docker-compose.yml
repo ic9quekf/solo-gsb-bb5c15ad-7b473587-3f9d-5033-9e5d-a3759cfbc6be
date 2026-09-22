@@ -1,0 +1,24 @@
+services:
+  webhook-replay:
+    build: .
+    image: webhook-replay-lab:latest
+    container_name: webhook-replay-lab
+    ports:
+      - "8000:8000"
+    environment:
+      # SQLite database location inside the container (mounted volume below)
+      REPLAY_DB: /data/webhook_replay.db
+    volumes:
+      - replay-data:/data
+    restart: unless-stopped
+    init: true
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2).status==200 else 1)"]
+      interval: 15s
+      timeout: 3s
+      start_period: 5s
+      retries: 5
+
+volumes:
+  replay-data:

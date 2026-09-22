@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.git/
+.gitignore
+*.db
+*.db-wal
+*.db-shm
+/data/
+.pytest_cache/
+.venv/
+smoke_test.py
+README.md
