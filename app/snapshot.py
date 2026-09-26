@@ -4,9 +4,11 @@ A snapshot is a zip archive (always written with forward-slash zip member
 names) containing one JSONL file per table plus a ``manifest.json``:
 
     manifest.json
-    settings.jsonl   -- exactly 1 row, kept only for reference
-    events.jsonl     -- one event per line, fixed field order
-    attempts.jsonl   -- one attempt per line, fixed field order
+    settings.jsonl    -- exactly 1 row, kept only for reference
+    targets.jsonl     -- named fan-out targets, kept only for reference
+    events.jsonl      -- one event per line, fixed field order
+    deliveries.jsonl  -- per (event, target) delivery state, fixed field order
+    attempts.jsonl    -- one attempt per line, fixed field order
 
 Each JSONL file lists its fields in a single fixed order (the order declared
 in ``FIELDS`` below), and the manifest records per-file line counts, sizes,
@@ -27,10 +29,12 @@ from typing import Any
 from . import db
 
 FORMAT = "webhook-replay-lab-snapshot"
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 
 SETTINGS_FILE = "settings.jsonl"
+TARGETS_FILE = "targets.jsonl"
 EVENTS_FILE = "events.jsonl"
+DELIVERIES_FILE = "deliveries.jsonl"
 ATTEMPTS_FILE = "attempts.jsonl"
 MANIFEST_NAME = "manifest.json"
 
@@ -39,17 +43,24 @@ FIELDS: dict[str, list[str]] = {
     SETTINGS_FILE: [
         "id", "target_url", "hmac_secret", "max_retries", "timeout_seconds",
     ],
+    TARGETS_FILE: [
+        "name", "url", "enabled", "position", "created_at", "updated_at",
+    ],
     EVENTS_FILE: [
         "event_id", "seq", "payload", "status", "created_at", "updated_at",
     ],
+    DELIVERIES_FILE: [
+        "event_id", "target", "status", "updated_at",
+    ],
     ATTEMPTS_FILE: [
-        "id", "event_id", "attempt_no", "replay_no", "idem_key", "request_at",
-        "response_at", "http_status", "outcome", "elapsed_ms", "req_headers",
-        "resp_excerpt",
+        "id", "event_id", "target", "attempt_no", "replay_no", "idem_key",
+        "request_at", "response_at", "http_status", "outcome", "elapsed_ms",
+        "req_headers", "resp_excerpt",
     ],
 }
 
 EVENT_STATUSES = {"pending", "queued", "running", "success", "failed"}
+DELIVERY_STATUSES = {"delivered", "failed"}
 ATTEMPT_OUTCOMES = {"delivered", "retriable", "non_retriable"}
 
 # Simple guard against oversized / decompression-bomb uploads.
@@ -92,9 +103,14 @@ def create_backup() -> tuple[bytes, str, dict[str, Any]]:
     snap = db.dump_snapshot()
 
     payload: dict[str, bytes] = {
-        SETTINGS_FILE: _encode_jsonl(snap["settings"], FIELDS[SETTINGS_FILE]),
-        EVENTS_FILE: _encode_jsonl(snap["events"], FIELDS[EVENTS_FILE]),
-        ATTEMPTS_FILE: _encode_jsonl(snap["attempts"], FIELDS[ATTEMPTS_FILE]),
+        fname: _encode_jsonl(snap[key], FIELDS[fname])
+        for fname, key in (
+            (SETTINGS_FILE, "settings"),
+            (TARGETS_FILE, "targets"),
+            (EVENTS_FILE, "events"),
+            (DELIVERIES_FILE, "deliveries"),
+            (ATTEMPTS_FILE, "attempts"),
+        )
     }
     files = [_file_meta(name, data) for name, data in payload.items()]
     manifest = {
@@ -103,7 +119,8 @@ def create_backup() -> tuple[bytes, str, dict[str, Any]]:
         "db_version": db.SCHEMA_VERSION,
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "files": {m["name"]: m for m in files},
-        "note": "settings.jsonl is informational; restore preserves current settings",
+        "note": "settings.jsonl/targets.jsonl are informational; "
+                "restore preserves current configuration",
     }
 
     buf = io.BytesIO()
@@ -135,8 +152,9 @@ def _is_number(v: Any) -> bool:
 def parse_snapshot(content: bytes) -> dict[str, Any]:
     """Validate an uploaded archive fully without touching the database.
 
-    Returns ``{"manifest", "settings", "events", "attempts"}`` with parsed
-    rows. Raises :class:`SnapshotError` on any problem.
+    Returns ``{"manifest", "settings", "targets", "events", "deliveries",
+    "attempts"}`` with parsed rows. Raises :class:`SnapshotError` on any
+    problem.
     """
     if not content:
         raise SnapshotError("上传内容为空，请选择有效的快照压缩包")
@@ -149,7 +167,8 @@ def parse_snapshot(content: bytes) -> dict[str, Any]:
         raise SnapshotError("不是有效的 zip 压缩包")
 
     names = zf.namelist()
-    expected = {MANIFEST_NAME, SETTINGS_FILE, EVENTS_FILE, ATTEMPTS_FILE}
+    expected = {MANIFEST_NAME, SETTINGS_FILE, TARGETS_FILE, EVENTS_FILE,
+                DELIVERIES_FILE, ATTEMPTS_FILE}
     if set(names) != expected:
         missing = sorted(expected - set(names))
         extra = sorted(set(names) - expected)
@@ -175,12 +194,15 @@ def parse_snapshot(content: bytes) -> dict[str, Any]:
     manifest = _validate_manifest(raw[MANIFEST_NAME], raw, errors)
 
     tables: dict[str, list[dict[str, Any]]] = {}
-    for fname in (SETTINGS_FILE, EVENTS_FILE, ATTEMPTS_FILE):
+    for fname in (SETTINGS_FILE, TARGETS_FILE, EVENTS_FILE,
+                  DELIVERIES_FILE, ATTEMPTS_FILE):
         tables[fname] = _validate_jsonl(fname, raw[fname],
                                         manifest, errors)
 
     settings = tables[SETTINGS_FILE]
+    targets = tables[TARGETS_FILE]
     events = tables[EVENTS_FILE]
+    deliveries = tables[DELIVERIES_FILE]
     attempts = tables[ATTEMPTS_FILE]
 
     # ---- table-specific semantic checks ----
@@ -198,6 +220,27 @@ def parse_snapshot(content: bytes) -> dict[str, Any]:
             errors.append(f"{SETTINGS_FILE}: max_retries 必须是 0–10 的整数")
         if not _is_number(s.get("timeout_seconds")) or not 0 < s["timeout_seconds"] <= 60:
             errors.append(f"{SETTINGS_FILE}: timeout_seconds 必须是 0–60 之间的数字")
+
+    if not 1 <= len(targets) <= 5:
+        errors.append(f"{TARGETS_FILE}: 必须包含 1–5 行目标，实际 {len(targets)} 行")
+    target_names: set[str] = set()
+    for i, t in enumerate(targets, 1):
+        name = t.get("name")
+        if not _is_str(name):
+            errors.append(f"{TARGETS_FILE} 第 {i} 行: name 必须是非空字符串")
+        elif name in target_names:
+            errors.append(f"{TARGETS_FILE} 第 {i} 行: name 重复：{name!r}")
+        else:
+            target_names.add(name)
+        if not _is_str(t.get("url")):
+            errors.append(f"{TARGETS_FILE} 第 {i} 行: url 必须是非空字符串")
+        if t.get("enabled") not in (0, 1):
+            errors.append(f"{TARGETS_FILE} 第 {i} 行: enabled 必须是 0 或 1")
+        if not _is_int(t.get("position")) or t["position"] < 0:
+            errors.append(f"{TARGETS_FILE} 第 {i} 行: position 必须是 ≥0 的整数")
+        for col in ("created_at", "updated_at"):
+            if not _is_str(t.get(col)):
+                errors.append(f"{TARGETS_FILE} 第 {i} 行: {col} 必须是非空字符串")
 
     event_ids: set[str] = set()
     seqs: set[int] = set()
@@ -235,6 +278,28 @@ def parse_snapshot(content: bytes) -> dict[str, Any]:
             if not _is_str(e.get(col)):
                 errors.append(f"{EVENTS_FILE} 第 {i} 行: {col} 必须是非空字符串")
 
+    delivery_keys: set[tuple[str, str]] = set()
+    for i, d in enumerate(deliveries, 1):
+        eid = d.get("event_id")
+        if eid not in event_ids:
+            errors.append(
+                f"{DELIVERIES_FILE} 第 {i} 行: 外键 event_id={eid!r}"
+                " 在 events.jsonl 中不存在")
+        if not _is_str(d.get("target")):
+            errors.append(f"{DELIVERIES_FILE} 第 {i} 行: target 必须是非空字符串")
+        key = (str(eid), str(d.get("target")))
+        if key in delivery_keys:
+            errors.append(
+                f"{DELIVERIES_FILE} 第 {i} 行: (event_id, target) 重复：{key!r}")
+        else:
+            delivery_keys.add(key)
+        if d.get("status") not in DELIVERY_STATUSES:
+            errors.append(
+                f"{DELIVERIES_FILE} 第 {i} 行: status 非法（{d.get('status')!r}），"
+                f"允许值：{sorted(DELIVERY_STATUSES)}")
+        if not _is_str(d.get("updated_at")):
+            errors.append(f"{DELIVERIES_FILE} 第 {i} 行: updated_at 必须是非空字符串")
+
     attempt_ids: set[int] = set()
     for i, a in enumerate(attempts, 1):
         aid = a.get("id")
@@ -248,6 +313,8 @@ def parse_snapshot(content: bytes) -> dict[str, Any]:
             errors.append(
                 f"{ATTEMPTS_FILE} 第 {i} 行: 外键 event_id={a.get('event_id')!r}"
                 " 在 events.jsonl 中不存在")
+        if not _is_str(a.get("target")):
+            errors.append(f"{ATTEMPTS_FILE} 第 {i} 行: target 必须是非空字符串")
         if not _is_int(a.get("attempt_no")) or a["attempt_no"] < 1:
             errors.append(f"{ATTEMPTS_FILE} 第 {i} 行: attempt_no 必须是 ≥1 的整数")
         if not _is_int(a.get("replay_no")) or a["replay_no"] < 1:
@@ -282,7 +349,9 @@ def parse_snapshot(content: bytes) -> dict[str, Any]:
     return {
         "manifest": manifest,
         "settings": settings,
+        "targets": targets,
         "events": events,
+        "deliveries": deliveries,
         "attempts": attempts,
     }
 

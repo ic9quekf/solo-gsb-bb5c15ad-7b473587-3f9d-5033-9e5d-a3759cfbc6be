@@ -58,6 +58,7 @@ async def receive(
         "idempotency_key": idem,
         "signature": request.headers.get("X-Webhook-Signature", ""),
         "event": request.headers.get("X-Webhook-Event", ""),
+        "target": request.headers.get("X-Webhook-Target", ""),
         "attempt": request.headers.get("X-Replay-Attempt", ""),
         "remote": request.client.host if request.client else "",
         "payload": parsed,

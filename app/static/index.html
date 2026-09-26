@@ -14,11 +14,17 @@
 
 <main>
   <section class="card">
-    <h2>1 · 目标配置</h2>
-    <div class="grid4">
-      <label class="span2">目标 URL
-        <input id="target_url" placeholder="http://127.0.0.1:8000/recv"/>
-      </label>
+    <h2>1 · 目标配置（1–5 个命名目标，扇出投递）</h2>
+    <p class="muted">
+      每个事件会<b>分别签名</b>并投递到所有启用目标；<b>全部目标送达</b>事件才标记为成功。
+      单目标场景保留一行即可（兼容旧配置，默认目标名为 <code>default</code>）。
+    </p>
+    <div id="targets-editor"></div>
+    <div class="row">
+      <button id="add-target">＋ 添加目标</button>
+      <span class="muted">名称用于标识目标（字母/数字/-/ _），URL 需以 http(s):// 开头</span>
+    </div>
+    <div class="grid4" style="margin-top:12px">
       <label>HMAC 密钥
         <input id="hmac_secret" placeholder="shhh"/>
       </label>
@@ -64,14 +70,14 @@
     <h2>3 · 事件队列</h2>
     <div class="row">
       <button id="replay-all" class="primary">▶ 按顺序发送全部</button>
-      <button id="replay-failed">↻ 仅重放失败事件</button>
+      <button id="replay-failed">↻ 重放失败事件的未送达目标</button>
       <button id="refresh">刷新</button>
       <span class="spacer"></span>
       <button id="clear" class="danger">🗑 清理历史记录</button>
     </div>
     <table>
       <thead>
-      <tr><th>#</th><th>事件 ID</th><th>状态</th><th>尝试次数</th><th>最后结果</th><th>操作</th></tr>
+      <tr><th>#</th><th>事件 ID</th><th>状态</th><th>目标投递</th><th>尝试次数</th><th>操作</th></tr>
       </thead>
       <tbody id="events-body"><tr><td colspan="6" class="muted center">暂无事件</td></tr></tbody>
     </table>
@@ -81,7 +87,7 @@
     <h2>4 · 请求时间轴（最近 200 条尝试）</h2>
     <table>
       <thead>
-      <tr><th>时间</th><th>事件</th><th>轮次/尝试</th><th>HTTP</th><th>结果</th><th>耗时</th><th>响应摘要</th></tr>
+      <tr><th>时间</th><th>事件</th><th>目标</th><th>轮次/尝试</th><th>HTTP</th><th>结果</th><th>耗时</th><th>响应摘要</th></tr>
       </thead>
       <tbody id="timeline-body"></tbody>
     </table>
@@ -90,11 +96,11 @@
   <section class="card">
     <h2>5 · 实验数据快照备份 / 恢复</h2>
     <p class="muted">
-      备份会把当前 <b>settings / events / attempts</b> 导出为 JSONL 压缩包（<code>.zip</code>），
+      备份会把当前 <b>settings / targets / events / deliveries / attempts</b> 导出为 JSONL 压缩包（<code>.zip</code>），
       包内 <code>manifest.json</code> 记录每个文件的行数、字节数、SHA-256 与数据库版本。<br/>
-      恢复前会完整校验 manifest、SHA-256、固定字段顺序、事件载荷可解析性以及 attempts → events 的外键关系，
-      <b style="color:var(--yellow)">任一错误都拒绝写入</b>；校验通过后在单事务内整体替换事件与尝试记录，
-      <b style="color:var(--green)">当前目标配置始终保留</b>（快照中的设置仅存档）。投递进行中无法恢复。
+      恢复前会完整校验 manifest、SHA-256、固定字段顺序、事件载荷可解析性以及 deliveries/attempts → events 的外键关系，
+      <b style="color:var(--yellow)">任一错误都拒绝写入</b>；校验通过后在单事务内整体替换事件、各目标投递状态与尝试记录，
+      <b style="color:var(--green)">当前目标配置始终保留</b>（快照中的设置与目标仅存档）。投递进行中无法恢复。
     </p>
     <div class="row">
       <a class="btn primary" href="/api/backup" id="backup-link">⬇ 下载快照 (.zip)</a>

@@ -1,4 +1,4 @@
-"""SQLite persistence layer (single row of settings + events/attempts)."""
+"""SQLite persistence layer (settings + targets + events/deliveries/attempts)."""
 from __future__ import annotations
 
 import json
@@ -10,9 +10,14 @@ from typing import Any
 
 DB_PATH = os.environ.get("REPLAY_DB", "/data/webhook_replay.db")
 
-# Bump whenever the settings/events/attempts table definitions change; backup
-# manifests record this and incompatible snapshots are rejected on restore.
-SCHEMA_VERSION = 1
+# Bump whenever the settings/targets/events/deliveries/attempts table definitions
+# change; backup manifests record this and incompatible snapshots are rejected
+# on restore.
+#   v1: settings / events / attempts
+#   v2: + targets table, + deliveries table, + attempts.target column
+SCHEMA_VERSION = 2
+
+DEFAULT_TARGET = "default"
 
 _lock = threading.RLock()
 
@@ -54,6 +59,15 @@ def init_db() -> None:
             );
             INSERT OR IGNORE INTO settings (id) VALUES (1);
 
+            CREATE TABLE IF NOT EXISTS targets (
+                name       TEXT PRIMARY KEY,
+                url        TEXT NOT NULL,
+                enabled    INTEGER NOT NULL DEFAULT 1,
+                position   INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS events (
                 event_id   TEXT PRIMARY KEY,
                 seq        INTEGER NOT NULL,
@@ -63,9 +77,18 @@ def init_db() -> None:
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS deliveries (
+                event_id   TEXT NOT NULL REFERENCES events(event_id) ON DELETE CASCADE,
+                target     TEXT NOT NULL,
+                status     TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (event_id, target)
+            );
+
             CREATE TABLE IF NOT EXISTS attempts (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_id     TEXT NOT NULL REFERENCES events(event_id) ON DELETE CASCADE,
+                target       TEXT NOT NULL DEFAULT 'default',
                 attempt_no   INTEGER NOT NULL,
                 replay_no    INTEGER NOT NULL,
                 idem_key     TEXT NOT NULL,
@@ -79,6 +102,22 @@ def init_db() -> None:
             );
             """
         )
+        # migration from v1: attempts gained a target column
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(attempts)")]
+        if "target" not in cols:
+            conn.execute(
+                "ALTER TABLE attempts ADD COLUMN target TEXT NOT NULL DEFAULT 'default'")
+        # seed the implicit single target from the legacy settings URL
+        row = conn.execute("SELECT COUNT(*) AS n FROM targets").fetchone()
+        if int(row["n"]) == 0:
+            legacy = conn.execute(
+                "SELECT target_url FROM settings WHERE id = 1").fetchone()
+            now = utcnow()
+            conn.execute(
+                "INSERT INTO targets (name, url, enabled, position, created_at, updated_at)"
+                " VALUES (?, ?, 1, 0, ?, ?)",
+                (DEFAULT_TARGET, legacy["target_url"], now, now),
+            )
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
@@ -92,12 +131,76 @@ def get_settings() -> dict[str, Any]:
 
 def update_settings(target_url: str, hmac_secret: str, max_retries: int,
                     timeout_seconds: float) -> dict[str, Any]:
+    """Legacy single-target update: keeps the 'default' target in sync."""
     with _lock, get_conn() as conn:
         conn.execute(
             "UPDATE settings SET target_url=?, hmac_secret=?, max_retries=?, timeout_seconds=? WHERE id=1",
             (target_url, hmac_secret, max_retries, timeout_seconds),
         )
+        _upsert_default_target(conn, target_url)
     return get_settings()
+
+
+def update_globals(hmac_secret: str, max_retries: int,
+                   timeout_seconds: float) -> None:
+    """Update only the global delivery knobs; leave every target untouched."""
+    with _lock, get_conn() as conn:
+        conn.execute(
+            "UPDATE settings SET hmac_secret=?, max_retries=?, timeout_seconds=? WHERE id=1",
+            (hmac_secret, max_retries, timeout_seconds),
+        )
+
+
+def _upsert_default_target(conn: sqlite3.Connection, url: str) -> None:
+    now = utcnow()
+    row = conn.execute(
+        "SELECT name FROM targets WHERE name=?", (DEFAULT_TARGET,)).fetchone()
+    if row is None:
+        pos = conn.execute(
+            "SELECT COALESCE(MAX(position), -1) + 1 AS p FROM targets").fetchone()
+        conn.execute(
+            "INSERT INTO targets (name, url, enabled, position, created_at, updated_at)"
+            " VALUES (?, ?, 1, ?, ?, ?)",
+            (DEFAULT_TARGET, url, int(pos["p"]), now, now),
+        )
+    else:
+        conn.execute(
+            "UPDATE targets SET url=?, updated_at=? WHERE name=?",
+            (url, now, DEFAULT_TARGET),
+        )
+
+
+# ---------- targets ----------
+
+def list_targets() -> list[dict[str, Any]]:
+    with _lock, get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM targets ORDER BY position ASC, name ASC").fetchall()
+        return [dict(r) for r in rows]
+
+
+def enabled_targets() -> list[dict[str, Any]]:
+    """Dispatch fan-out set, in configured order."""
+    return [t for t in list_targets() if t["enabled"]]
+
+
+def replace_targets(targets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Atomically replace the whole target set (already validated)."""
+    now = utcnow()
+    with _lock, get_conn() as conn:
+        conn.execute("DELETE FROM targets")
+        for pos, t in enumerate(targets):
+            conn.execute(
+                "INSERT INTO targets (name, url, enabled, position, created_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (t["name"], t["url"], 1 if t.get("enabled", True) else 0,
+                 pos, now, now),
+            )
+        # keep the legacy single-target column pointing at something sensible
+        primary = next((t["url"] for t in targets if t["name"] == DEFAULT_TARGET),
+                       targets[0]["url"])
+        conn.execute("UPDATE settings SET target_url=? WHERE id=1", (primary,))
+    return list_targets()
 
 
 # ---------- events ----------
@@ -124,9 +227,12 @@ def upsert_event(event_id: str, payload: dict[str, Any]) -> tuple[dict[str, Any]
             )
             created = True
         else:
-            # new content -> fresh lifecycle
+            # new content -> fresh lifecycle (attempts + per-target states reset)
             conn.execute(
                 "DELETE FROM attempts WHERE event_id=?", (event_id,)
+            )
+            conn.execute(
+                "DELETE FROM deliveries WHERE event_id=?", (event_id,)
             )
             conn.execute(
                 "UPDATE events SET payload=?, status='pending', updated_at=? WHERE event_id=?",
@@ -154,7 +260,11 @@ def list_events() -> list[dict[str, Any]]:
             FROM events e ORDER BY e.seq ASC
             """
         ).fetchall()
-        return [dict(r) for r in rows]
+        events = [dict(r) for r in rows]
+        dmap = deliveries_map()
+    for e in events:
+        e["deliveries"] = dmap.get(e["event_id"], {})
+    return events
 
 
 def events_by_status(statuses: tuple[str, ...]) -> list[dict[str, Any]]:
@@ -175,26 +285,75 @@ def set_event_status(event_id: str, status: str) -> None:
         )
 
 
-def latest_replay_no(conn: sqlite3.Connection, event_id: str) -> int:
+# ---------- deliveries (per event x target state) ----------
+
+DELIVERY_DELIVERED = "delivered"
+DELIVERY_FAILED = "failed"
+
+
+def upsert_delivery(event_id: str, target: str, status: str) -> None:
+    now = utcnow()
+    with _lock, get_conn() as conn:
+        conn.execute(
+            """INSERT INTO deliveries (event_id, target, status, updated_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(event_id, target)
+               DO UPDATE SET status=excluded.status, updated_at=excluded.updated_at""",
+            (event_id, target, status, now),
+        )
+        conn.execute("UPDATE events SET updated_at=? WHERE event_id=?",
+                     (now, event_id))
+
+
+def deliveries_for_event(event_id: str) -> list[dict[str, Any]]:
+    with _lock, get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM deliveries WHERE event_id=? ORDER BY target ASC",
+            (event_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def deliveries_map() -> dict[str, dict[str, str]]:
+    """{event_id: {target: status}} for every recorded delivery."""
+    with _lock, get_conn() as conn:
+        rows = conn.execute("SELECT event_id, target, status FROM deliveries").fetchall()
+    out: dict[str, dict[str, str]] = {}
+    for r in rows:
+        out.setdefault(r["event_id"], {})[r["target"]] = r["status"]
+    return out
+
+
+def pending_targets(event_id: str, enabled_names: list[str]) -> list[str]:
+    """Enabled targets this event has not been successfully delivered to."""
+    state = deliveries_map().get(event_id, {})
+    return [n for n in enabled_names if state.get(n) != DELIVERY_DELIVERED]
+
+
+# ---------- attempts ----------
+
+def latest_replay_no(conn: sqlite3.Connection, event_id: str,
+                     target: str) -> int:
     row = conn.execute(
-        "SELECT COALESCE(MAX(replay_no), 0) AS n FROM attempts WHERE event_id=?",
-        (event_id,),
+        "SELECT COALESCE(MAX(replay_no), 0) AS n FROM attempts"
+        " WHERE event_id=? AND target=?",
+        (event_id, target),
     ).fetchone()
     return int(row["n"])
 
 
-def record_attempt(event_id: str, *, attempt_no: int, replay_no: int,
+def record_attempt(event_id: str, *, target: str, attempt_no: int, replay_no: int,
                    idem_key: str, request_at: str, req_headers: dict[str, str],
                    response_at: str | None, http_status: int | None,
                    outcome: str, elapsed_ms: int, resp_excerpt: str) -> None:
     with _lock, get_conn() as conn:
         conn.execute(
             """INSERT INTO attempts
-               (event_id, attempt_no, replay_no, idem_key, request_at, response_at,
-                http_status, outcome, elapsed_ms, req_headers, resp_excerpt)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (event_id, attempt_no, replay_no, idem_key, request_at, response_at,
-             http_status, outcome, elapsed_ms,
+               (event_id, target, attempt_no, replay_no, idem_key, request_at,
+                response_at, http_status, outcome, elapsed_ms, req_headers, resp_excerpt)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (event_id, target, attempt_no, replay_no, idem_key, request_at,
+             response_at, http_status, outcome, elapsed_ms,
              json.dumps(req_headers, ensure_ascii=False), resp_excerpt[:2000]),
         )
         conn.execute("UPDATE events SET updated_at=? WHERE event_id=?",
@@ -221,28 +380,36 @@ def timeline(limit: int = 200) -> list[dict[str, Any]]:
 
 
 def clear_history() -> None:
-    """Delete all events and attempts. Settings are preserved."""
+    """Delete all events, deliveries and attempts. Settings/targets preserved."""
     with _lock, get_conn() as conn:
         conn.execute("DELETE FROM attempts")
+        conn.execute("DELETE FROM deliveries")
         conn.execute("DELETE FROM events")
 
 
 # ---------- snapshot backup / restore ----------
 
 def dump_snapshot() -> dict[str, list[dict[str, Any]]]:
-    """Read settings/events/attempts in one consistent transaction."""
+    """Read all tables in one consistent transaction."""
     with _lock, get_conn() as conn:
         settings = [dict(r) for r in conn.execute("SELECT * FROM settings ORDER BY id")]
+        targets = [dict(r) for r in
+                   conn.execute("SELECT * FROM targets ORDER BY position, name")]
         events = [dict(r) for r in conn.execute("SELECT * FROM events ORDER BY seq")]
+        deliveries = [dict(r) for r in
+                      conn.execute("SELECT * FROM deliveries ORDER BY event_id, target")]
         attempts = [dict(r) for r in conn.execute("SELECT * FROM attempts ORDER BY id")]
-    return {"settings": settings, "events": events, "attempts": attempts}
+    return {"settings": settings, "targets": targets, "events": events,
+            "deliveries": deliveries, "attempts": attempts}
 
 
-def restore_rows(settings: list[dict[str, Any]], events: list[dict[str, Any]],
+def restore_rows(settings: list[dict[str, Any]], targets: list[dict[str, Any]],
+                 events: list[dict[str, Any]], deliveries: list[dict[str, Any]],
                  attempts: list[dict[str, Any]]) -> None:
-    """Replace events/attempts inside a single transaction.
+    """Replace events/deliveries/attempts inside a single transaction.
 
-    Settings are intentionally untouched (current configuration is preserved).
+    Settings and targets are intentionally untouched (current configuration is
+    preserved); the snapshot's copies are archived for reference only.
     Must be called with data already validated; FK enforcement is on and the
     whole statement sequence commits atomically or rolls back.
     """
@@ -250,6 +417,7 @@ def restore_rows(settings: list[dict[str, Any]], events: list[dict[str, Any]],
         try:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute("DELETE FROM attempts")
+            conn.execute("DELETE FROM deliveries")
             conn.execute("DELETE FROM events")
             conn.executemany(
                 "INSERT INTO events (event_id, seq, payload, status, created_at, updated_at)"
@@ -257,11 +425,16 @@ def restore_rows(settings: list[dict[str, Any]], events: list[dict[str, Any]],
                 events,
             )
             conn.executemany(
+                "INSERT INTO deliveries (event_id, target, status, updated_at)"
+                " VALUES (:event_id, :target, :status, :updated_at)",
+                deliveries,
+            )
+            conn.executemany(
                 """INSERT INTO attempts
-                   (id, event_id, attempt_no, replay_no, idem_key, request_at, response_at,
-                    http_status, outcome, elapsed_ms, req_headers, resp_excerpt)
-                   VALUES (:id, :event_id, :attempt_no, :replay_no, :idem_key, :request_at,
-                           :response_at, :http_status, :outcome, :elapsed_ms,
+                   (id, event_id, target, attempt_no, replay_no, idem_key, request_at,
+                    response_at, http_status, outcome, elapsed_ms, req_headers, resp_excerpt)
+                   VALUES (:id, :event_id, :target, :attempt_no, :replay_no, :idem_key,
+                           :request_at, :response_at, :http_status, :outcome, :elapsed_ms,
                            :req_headers, :resp_excerpt)""",
                 attempts,
             )

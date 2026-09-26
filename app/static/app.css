@@ -51,6 +51,26 @@ main { max-width: 1100px; margin: 0 auto; padding: 20px; }
 }
 .grid4 .span2 { grid-column: span 2; }
 
+/* targets editor */
+#targets-editor { display: flex; flex-direction: column; gap: 8px; }
+.target-row {
+  display: grid;
+  grid-template-columns: auto 160px 1fr auto;
+  gap: 8px;
+  align-items: center;
+}
+.target-row .tgt-enabled {
+  flex-direction: row;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--muted);
+  cursor: pointer;
+}
+.target-row .tgt-enabled input { accent-color: var(--accent); }
+.target-row .tgt-name { width: 100%; }
+.tgt-badges .badge { margin: 1px 2px 1px 0; }
+
 label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
 
 input, textarea, select {

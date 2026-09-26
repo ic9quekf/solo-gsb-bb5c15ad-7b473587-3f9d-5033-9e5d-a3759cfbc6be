@@ -1,5 +1,11 @@
 """Background worker: sends events in FIFO order with exponential backoff retries.
 
+Multi-target fan-out: every queued item is ``(event_id, targets)`` where
+``targets`` is ``None`` (all currently enabled targets) or an explicit tuple of
+target names. Each (event, target) pair is signed, delivered, retried and
+recorded independently; an event only becomes ``success`` when *all* enabled
+targets have been delivered to.
+
 The worker runs an asyncio loop on a dedicated daemon thread. The HTTP client
 is an ``httpx.AsyncClient``; the enqueue API is thread-safe (called from
 FastAPI's sync endpoints) via ``run_coroutine_threadsafe``.
@@ -24,6 +30,9 @@ from .signing import canonical_body, idempotency_key, sign
 DELIVERED = "delivered"          # 2xx
 RETRIABLE = "retriable"          # timeout / network error / 408 / 429 / 5xx
 NON_RETRIABLE = "non_retriable"  # any other status (e.g. 4xx)
+
+# queue item: (event_id, explicit target names or None for "all enabled")
+QueueItem = tuple[str, tuple[str, ...] | None]
 
 
 def _ts() -> str:
@@ -51,7 +60,7 @@ class Dispatcher:
         self._lock = threading.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
-        self._q: asyncio.Queue[str] | None = None
+        self._q: asyncio.Queue[QueueItem] | None = None
         self._client_factory: Any = None  # async httpx client factory (test hook)
 
     # ---------- lifecycle ----------
@@ -86,7 +95,8 @@ class Dispatcher:
 
     # ---------- enqueue (safe to call from other threads) ----------
 
-    async def _aenqueue(self, event_id: str) -> bool:
+    async def _aenqueue(self, event_id: str,
+                        targets: tuple[str, ...] | None = None) -> bool:
         while self._q is None:
             await asyncio.sleep(0.01)
         with self._lock:
@@ -94,17 +104,29 @@ class Dispatcher:
                 return False
             self._inflight.add(event_id)
         db.set_event_status(event_id, "queued")
-        await self._q.put(event_id)
+        await self._q.put((event_id, targets))
         return True
 
-    def enqueue(self, event_id: str) -> bool:
+    def enqueue(self, event_id: str,
+                targets: tuple[str, ...] | list[str] | None = None) -> bool:
         if self._loop is None:
             raise RuntimeError("dispatcher not started")
-        fut = asyncio.run_coroutine_threadsafe(self._aenqueue(event_id), self._loop)
+        t = tuple(targets) if targets is not None else None
+        fut = asyncio.run_coroutine_threadsafe(
+            self._aenqueue(event_id, t), self._loop)
         return fut.result()
 
-    def enqueue_many(self, event_ids: list[str]) -> list[str]:
-        return [eid for eid in event_ids if self.enqueue(eid)]
+    def enqueue_many(self, items: list[str | tuple[str, tuple[str, ...] | None]]
+                     ) -> list[str]:
+        queued: list[str] = []
+        for item in items:
+            if isinstance(item, str):
+                eid, targets = item, None
+            else:
+                eid, targets = item
+            if self.enqueue(eid, targets):
+                queued.append(eid)
+        return queued
 
     def queue_depth(self) -> int:
         return self._q.qsize() if self._q else 0
@@ -123,9 +145,9 @@ class Dispatcher:
             client = httpx.AsyncClient()
         try:
             while True:
-                event_id = await self._q.get()
+                event_id, targets = await self._q.get()
                 try:
-                    await self._process(client, event_id)
+                    await self._process(client, event_id, targets)
                 except Exception as exc:  # never let the worker die
                     db.set_event_status(event_id, "failed")
                     print(f"[dispatcher] event {event_id} crashed: {exc!r}", flush=True)
@@ -136,29 +158,69 @@ class Dispatcher:
         finally:
             await client.aclose()
 
-    async def _process(self, client: httpx.AsyncClient, event_id: str) -> None:
+    async def _process(self, client: httpx.AsyncClient, event_id: str,
+                       requested: tuple[str, ...] | None) -> None:
         event = db.get_event(event_id)
         if event is None:
             return
         settings = db.get_settings()
+        enabled = db.enabled_targets()
+        by_name = {t["name"]: t for t in enabled}
+
+        if requested is None:
+            selected = [t["name"] for t in enabled]
+        else:
+            # drop names that are no longer enabled (config may have changed)
+            selected = [n for n in requested if n in by_name]
+
+        if not selected:
+            # nothing to do: recompute the status from recorded deliveries
+            self._finalize(event_id, enabled)
+            return
+
         db.set_event_status(event_id, "running")
 
         payload = json.loads(event["payload"])
         body = canonical_body(payload)
-
-        with db.get_conn() as conn:
-            replay_no = db.latest_replay_no(conn, event_id) + 1
-
         max_retries = int(settings["max_retries"])
         timeout = float(settings["timeout_seconds"])
         max_attempts = max_retries + 1
 
+        # fan out: each target is signed / delivered / retried independently
+        for name in selected:
+            url = by_name[name]["url"]
+            with db.get_conn() as conn:
+                replay_no = db.latest_replay_no(conn, event_id, name) + 1
+            outcome = await self._deliver_to_target(
+                client, event_id, name, url, body, settings["hmac_secret"],
+                replay_no, max_attempts, timeout)
+            db.upsert_delivery(
+                event_id, name,
+                db.DELIVERY_DELIVERED if outcome == DELIVERED else db.DELIVERY_FAILED)
+
+        self._finalize(event_id, enabled)
+
+    def _finalize(self, event_id: str,
+                  enabled: list[dict[str, Any]]) -> None:
+        """An event is success only when every enabled target was delivered."""
+        if not enabled:
+            db.set_event_status(event_id, "pending")
+            return
+        remaining = db.pending_targets(event_id, [t["name"] for t in enabled])
+        db.set_event_status(event_id, "success" if not remaining else "failed")
+
+    async def _deliver_to_target(self, client: httpx.AsyncClient, event_id: str,
+                                 target: str, url: str, body: bytes, secret: str,
+                                 replay_no: int, max_attempts: int,
+                                 timeout: float) -> str:
+        """Run one full retry round against a single target. Returns outcome."""
+        idem = idempotency_key(event_id, target, replay_no)
         for attempt_no in range(1, max_attempts + 1):
-            idem = idempotency_key(event_id, replay_no)
-            sig_header, ts = sign(body, settings["hmac_secret"])
+            sig_header, ts = sign(body, secret)
             headers = {
                 "Content-Type": "application/json",
                 "X-Webhook-Event": event_id,
+                "X-Webhook-Target": target,
                 "X-Webhook-Timestamp": str(ts),
                 "X-Webhook-Signature": sig_header,
                 "Idempotency-Key": idem,
@@ -168,13 +230,13 @@ class Dispatcher:
             }
             started = time.monotonic()
             request_at = _ts()
-            result = await self._send_once(
-                client, settings["target_url"], body, headers, timeout)
+            result = await self._send_once(client, url, body, headers, timeout)
             elapsed_ms = int((time.monotonic() - started) * 1000)
             response_at = _ts()
 
             db.record_attempt(
                 event_id,
+                target=target,
                 attempt_no=attempt_no,
                 replay_no=replay_no,
                 idem_key=idem,
@@ -188,17 +250,15 @@ class Dispatcher:
             )
 
             if result["outcome"] == DELIVERED:
-                db.set_event_status(event_id, "success")
-                return
-
+                return DELIVERED
             if result["outcome"] == NON_RETRIABLE or attempt_no >= max_attempts:
-                db.set_event_status(event_id, "failed")
-                return
+                return result["outcome"]
 
             # exponential backoff: 0.5s, 1s, 2s ... capped at 30s, 50-100% jitter
             delay = min(30.0, (2 ** (attempt_no - 1)) * 0.5)
             delay *= 0.5 + random.random() * 0.5
             await asyncio.sleep(delay)
+        return RETRIABLE  # unreachable, keeps type checkers happy
 
     async def _send_once(self, client: httpx.AsyncClient, url: str,
                          body: bytes, headers: dict[str, str],

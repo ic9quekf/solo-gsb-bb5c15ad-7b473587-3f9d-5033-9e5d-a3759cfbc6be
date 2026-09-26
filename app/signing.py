@@ -34,6 +34,7 @@ def verify(body: bytes, secret: str, header: str, tolerance: int = 300) -> bool:
     return hmac.compare_digest(expected.split("v1=", 1)[1], sig)
 
 
-def idempotency_key(event_id: str, replay_no: int) -> str:
-    raw = f"{event_id}#replay={replay_no}"
+def idempotency_key(event_id: str, target: str, replay_no: int) -> str:
+    """One key per (event, target, replay round); retries of a round share it."""
+    raw = f"{event_id}#{target}#replay={replay_no}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
